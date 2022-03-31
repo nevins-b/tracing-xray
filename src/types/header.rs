@@ -105,9 +105,13 @@ impl FromStr for Header {
         s.split(';')
             .try_fold(Header::default(), |mut header, line| {
                 if line.starts_with("Root=") {
-                    header.trace_id = TraceId::Rendered(line[5..].into())
+                    header.trace_id = TraceId::Rendered(
+                        line.strip_prefix("Root=").unwrap_or_default().to_string(),
+                    )
                 } else if line.starts_with("Parent=") {
-                    header.parent_id = Some(SegmentId::Rendered(line[7..].into()))
+                    header.parent_id = Some(SegmentId::Rendered(
+                        line.strip_prefix("Parent=").unwrap_or_default().to_string(),
+                    ))
                 } else if line.starts_with("Sampled=") {
                     header.sampling_decision = line.into();
                 } else if !line.starts_with("Self=") {

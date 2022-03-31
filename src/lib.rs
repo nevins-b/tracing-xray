@@ -9,8 +9,8 @@ use tracing_subscriber::{
 };
 
 mod types;
+use crate::types::header::{Header, SamplingDecision};
 use types::{
-    header::Header,
     ids::{SegmentId, TraceId},
     time::Seconds,
     types::Segment,
@@ -19,7 +19,17 @@ use types::{
 type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Default)]
-pub struct XRay;
+pub struct XRay {
+    resource_arn: Option<String>,
+}
+
+impl XRay {
+    pub fn with_resource_arn(self, arn: String) -> XRay {
+        XRay {
+            resource_arn: Some(arn),
+        }
+    }
+}
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct SharedData {
     pub(crate) trace_id: TraceId,
@@ -79,17 +89,48 @@ impl<S> Layer<S> for XRay
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    fn new_span(&self, attrs: &Attributes, id: &Id, ctx: Context<S>) {
-        if let Some(id) = attrs.metadata().fields().field("X-Amzn-Trace-Id") {
+    fn on_new_span(&self, attrs: &Attributes, id: &Id, ctx: Context<S>) {
+        let name = attrs.metadata().name();
+        let mut data = Segment::begin(name);
+
+        // in lambda context there should be a facade header that is the root of the execution
+        // if it exists use it to set the trace id and parent id
+        // the parent id will be overridden later when on_follows_from is called
+        if let Some(id) = attrs.metadata().fields().field("x-amzn-trace-id") {
             let header = id
                 .to_string()
                 .parse::<Header>()
                 .expect("Unstable to parse header");
+            if header.sampling_decision.eq(&SamplingDecision::NotSampled) {
+                return;
+            }
+            data.trace_id = header.trace_id;
+            data.parent_id = header.parent_id;
         }
-        let name = attrs.metadata().name();
-        let mut data = Segment::begin(name);
-        let span = ctx.span(id).expect("in new_span but span does not exist");
+        data.resource_arn = self.resource_arn.clone();
+
+        let span = ctx
+            .span(id)
+            .expect("in on_new_span but span does not exist");
         span.extensions_mut().insert(data);
+    }
+
+    fn on_follows_from(&self, id: &Id, follows: &Id, ctx: Context<S>) {
+        let span = ctx.span(id).expect("Span not found, this is a bug");
+        let mut ext = span.extensions_mut();
+        let data = ext
+            .get_mut::<Segment>()
+            .expect("span does not have XRay segment");
+
+        let follows_span = ctx
+            .span(follows)
+            .expect("Span to follow not found, this is a bug");
+        let follows_ext = follows_span.extensions();
+        let follows_data = follows_ext
+            .get::<Segment>()
+            .expect("span does not have XRay segment");
+
+        data.parent_id = Some(follows_data.id.clone());
     }
 
     fn on_close(&self, id: Id, ctx: Context<S>) {
